@@ -95,6 +95,38 @@ sudo systemctl restart elastic-agent
 ```
 Tunggu 30–60 detik, cek lagi.
 
+### Langkah 7 — Nyalakan endpoint Windows, cek service Elastic Agent
+
+Berbeda dengan Linux (Elastic Agent jalan sebagai systemd service, auto-start saat boot), 
+service Elastic Agent di Windows **tidak selalu ikut start otomatis** meski StartType 
+sudah `Automatic` — khususnya setelah VM lama tidak dinyalakan. Jangan asumsi otomatis sehat.
+
+```powershell
+Get-Service -Name "Elastic Agent"
+```
+
+| Status | Tindakan |
+|---|---|
+| `Running` | Lanjut, cek Fleet → Agents untuk konfirmasi `Healthy` |
+| `Stopped` | Start manual (lihat di bawah) |
+
+**Kalau `Stopped`:** `Start-Service` HARUS dijalankan dari PowerShell **as Administrator** 
+— kalau tidak, akan gagal dengan error `Cannot open Elastic Agent service`.
+
+1. Buka PowerShell via **Run as administrator**
+2. ```powershell
+   Start-Service -Name "Elastic Agent"
+   ```
+3. Verifikasi ulang di Kibana → **Fleet → Agents**, tunggu sampai status `Healthy` (biasanya <1 menit).
+
+**Catatan diagnosis sebelum sampai ke fix ini** (urutan dari luar ke dalam, jangan langsung restart):
+```powershell
+ping 192.168.56.10
+Test-NetConnection -ComputerName 192.168.56.10 -Port 8220
+```
+Kalau keduanya sukses tapi Fleet tetap `Offline`, baru cek status service seperti di atas — 
+itu tandanya bukan masalah jaringan, tapi service lokal di Windows.
+
 ---
 
 ## 3. Log Troubleshooting (Kronologis)
@@ -226,6 +258,55 @@ Saat preview timeframe di-set ke "Last 7 days".
 **Root cause:** Satuan waktu di Elastic **case-sensitive**: `m` (kecil) = menit, `M` (besar) = bulan, `h` = jam, `d` = hari, `w` = minggu.
 
 **Fix:** Ketik ulang dengan huruf kecil yang benar (`1m` untuk 1 menit).
+
+---
+
+### Insiden #8 — Service & agent sudah sehat, tapi Kibana tetap tidak bisa diakses dari browser
+
+**Gejala:** `sudo systemctl status elasticsearch kibana` menunjukkan **`active (running)`** untuk keduanya, dan `sudo elastic-agent status` di semua mesin (server + endpoint) menunjukkan **`HEALTHY`** — tapi `http://192.168.56.10:5601` tetap tidak terbuka di browser Windows host (loading terus, timeout, atau "site can't be reached").
+
+**Kenapa ini membingungkan:** Semua indikator "normal" di level service dan agent sudah hijau, jadi penyebabnya **bukan** di Elasticsearch/Kibana/Fleet itu sendiri — harus dicari di lapisan lain (jaringan, firewall, atau browser).
+
+**Cara diagnosis — telusuri dari dalam ke luar, jangan tebak:**
+
+**Langkah 1 — Buktikan Kibana benar-benar menjawab dari dalam VM-nya sendiri**
+```bash
+curl -I http://localhost:5601
+```
+- `-I`: hanya ambil header response, cukup untuk tes cepat.
+- Kalau ini **gagal**, masalahnya ada di Kibana sendiri meski statusnya "running" (misal proses hang, port tidak benar-benar listen). Cek `sudo ss -tlnp | grep 5601` untuk pastikan port benar-benar listen, dan di IP mana (harus `192.168.56.10:5601`, bukan `127.0.0.1:5601` saja).
+- Kalau ini **berhasil**, lanjut ke langkah 2 — masalahnya ada di luar VM.
+
+**Langkah 2 — Tes dari host Windows, bukan browser dulu**
+```powershell
+ping 192.168.56.10
+Test-NetConnection 192.168.56.10 -Port 5601
+```
+- Kalau `ping` gagal: adapter Host-only bermasalah (sama seperti kasus endpoint yang pernah terjadi) — cek `ip -4 a` di elastic-server, pastikan `enp0s8` statusnya `UP` dan IP `192.168.56.10` masih ada.
+- Kalau `ping` berhasil tapi `Test-NetConnection` ke port 5601 `False`: ada yang memblokir port tersebut di antara host dan VM — lanjut ke langkah 3.
+
+**Langkah 3 — Cek firewall di dalam VM**
+```bash
+sudo ufw status
+```
+- Kalau UFW aktif dan tidak ada rule untuk port 5601, port itu akan diblokir meski Kibana sudah listen. Buka kalau perlu:
+```bash
+sudo ufw allow 5601/tcp
+```
+
+**Langkah 4 — Cek ulang `server.host` di kibana.yml**
+```bash
+sudo grep server.host /etc/kibana/kibana.yml
+```
+- Pastikan masih `"192.168.56.10"`, bukan ter-revert ke `"localhost"` (bisa terjadi kalau file config sempat ditimpa ulang saat reinstall/upgrade paket).
+
+**Langkah 5 — Baru curigai sisi browser**
+Kalau langkah 1–4 semua lolos (Kibana menjawab lokal, port terbuka dari host, firewall tidak memblokir, config benar) tapi browser tetap gagal:
+- Pastikan mengetik `http://` bukan `https://` (Kibana di setup ini belum pakai TLS, beda dengan Elasticsearch yang wajib HTTPS).
+- Coba **incognito/private window** atau browser lain — kemungkinan cache/cookie lama dari sesi sebelumnya (apalagi kalau IP atau port sempat berubah).
+- Cek apakah ada VPN/proxy aktif di Windows host yang mengganggu akses ke jaringan Host-only.
+
+**Pelajaran:** "Service running" dan "agent healthy" cuma membuktikan proses di dalam VM sehat — tidak membuktikan **jalur sampai ke browser kamu** juga sehat. Urutan diagnosis yang benar selalu dari titik paling dekat ke sumber masalah (proses lokal) baru melebar ke luar (jaringan → firewall → client), supaya tidak menebak-nebak di lapisan yang salah.
 
 ---
 
